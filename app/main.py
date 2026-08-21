@@ -26,7 +26,6 @@ node = Node(
 )
 
 
-
 @app.get("/")
 def health_check():
     return {
@@ -75,6 +74,7 @@ def get_value(key: str):
             detail="Key not found",
         )
 
+    # Followers return their local value directly.
     if node.role != "leader":
         return {
             "key": key,
@@ -109,4 +109,21 @@ def get_value(key: str):
         "successful_nodes": read_results["successful_nodes"],
         "quorum_achieved": True,
         "replicas": read_results["results"],
+    }
+
+
+@app.delete("/kv/{key}")
+def delete_value(key: str):
+    value = node.storage.delete(key)
+
+    if value is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Key not found",
+        )
+
+    return {
+        "key": key,
+        "status": "deleted",
+        "node": node.node_id,
     }
