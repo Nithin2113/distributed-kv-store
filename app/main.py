@@ -1,6 +1,8 @@
 
+import asyncio
 import hashlib
 import os
+from contextlib import asynccontextmanager
 from typing import List
 
 from fastapi import FastAPI, HTTPException
@@ -26,9 +28,55 @@ FOLLOWER_URLS: List[str] = [
 WRITE_QUORUM = 2
 READ_QUORUM = 2
 
+HEARTBEAT_INTERVAL = float(
+    os.getenv("HEARTBEAT_INTERVAL_SECONDS", "2")
+)
+HEARTBEAT_TIMEOUT = float(
+    os.getenv("HEARTBEAT_TIMEOUT_SECONDS", "1")
+)
+FAILURE_THRESHOLD = int(
+    os.getenv("HEARTBEAT_FAILURE_THRESHOLD", "2")
+)
+
 
 class PutRequest(BaseModel):
     value: str
+
+
+node = Node(
+    node_id=NODE_ID,
+    role=NODE_ROLE,
+    port=NODE_PORT,
+    storage_path=STORAGE_PATH,
+    followers=FOLLOWER_URLS if NODE_ROLE == "leader" else [],
+    heartbeat_timeout=HEARTBEAT_TIMEOUT,
+    failure_threshold=FAILURE_THRESHOLD,
+)
+
+
+async def heartbeat_monitor():
+    """Continuously monitor follower availability."""
+    while True:
+        await asyncio.to_thread(node.check_followers)
+        await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = None
+
+    if node.role == "leader":
+        task = asyncio.create_task(heartbeat_monitor())
+
+    yield
+
+    if task is not None:
+        task.cancel()
+
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 app = FastAPI(
@@ -37,20 +85,12 @@ app = FastAPI(
         "A self-healing distributed key-value store with "
         "quorum-based consistency and version-aware replica recovery."
     ),
-    version="0.3.0",
-)
-
-node = Node(
-    node_id=NODE_ID,
-    role=NODE_ROLE,
-    port=NODE_PORT,
-    storage_path=STORAGE_PATH,
-    followers=FOLLOWER_URLS if NODE_ROLE == "leader" else [],
+    version="0.4.0",
+    lifespan=lifespan,
 )
 
 
 def validate_record(record):
-    """Validate a replica record's structure and checksum."""
     if not isinstance(record, dict):
         return False
 
@@ -138,7 +178,11 @@ def cluster_config():
     }
 
 
-# Internal replication is accepted only by follower nodes.
+@app.get("/cluster/status", tags=["Cluster"])
+def cluster_status():
+    return node.get_health()
+
+
 @app.post("/internal/replicate", tags=["Internal Replication"])
 def receive_replica(record: dict):
     if node.role != "follower":
@@ -150,15 +194,11 @@ def receive_replica(record: dict):
     result = node.storage.apply_record(record)
 
     if not result["success"]:
-        raise HTTPException(
-            status_code=409,
-            detail=result,
-        )
+        raise HTTPException(status_code=409, detail=result)
 
     return result
 
 
-# Internal endpoint: return complete record, including tombstones.
 @app.get("/internal/record/{key}", tags=["Internal Replication"])
 def internal_get_record(key: str):
     return {
@@ -167,7 +207,6 @@ def internal_get_record(key: str):
     }
 
 
-# Only the leader can coordinate client writes.
 @app.put("/kv/{key}", tags=["Key-Value"])
 def put_value(key: str, request: PutRequest):
     if node.role != "leader":
@@ -178,7 +217,6 @@ def put_value(key: str, request: PutRequest):
 
     value = request.value
     record = node.storage.put(key, value)
-
     replication = node.replicate_record(record)
 
     quorum_achieved = (
@@ -206,7 +244,6 @@ def put_value(key: str, request: PutRequest):
 
 @app.get("/kv/{key}", tags=["Key-Value"])
 def get_value(key: str):
-    # Followers can serve reads from their local storage.
     if node.role != "leader":
         value = node.storage.get(key)
 
@@ -222,7 +259,6 @@ def get_value(key: str):
             "node": node.node_id,
         }
 
-    # Start with the leader's local record.
     local_record = node.storage.get_record(key)
     read_results = node.read_from_followers(key)
 
@@ -268,7 +304,6 @@ def get_value(key: str):
             },
         )
 
-    # Gather all existing records and choose the highest version.
     candidates = []
 
     if local_record is not None:
@@ -297,7 +332,6 @@ def get_value(key: str):
         if item["record"]["version"] == highest_version
     ]
 
-    # Equal versions must represent the same operation and content.
     reference = newest_records[0]
 
     for other in newest_records[1:]:
@@ -320,7 +354,6 @@ def get_value(key: str):
 
     newest_record = reference
 
-    # Repair the leader if it has a stale or missing record.
     if (
         local_record is None
         or local_record["version"] < newest_record["version"]
@@ -336,7 +369,6 @@ def get_value(key: str):
                 },
             )
 
-    # Repair followers that are missing or behind.
     repairs = []
 
     for result in valid_results:
@@ -370,7 +402,6 @@ def get_value(key: str):
     }
 
 
-# Only the leader can coordinate client deletes.
 @app.delete("/kv/{key}", tags=["Key-Value"])
 def delete_value(key: str):
     if node.role != "leader":

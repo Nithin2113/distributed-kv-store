@@ -8,8 +8,10 @@ from pathlib import Path
 
 class KeyValueStore:
     def __init__(self, file_path="data/orbit.db"):
-        self.file_path = Path(file_path)
-        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        self.file_path = Path(file_path) if file_path != ":memory:" else file_path
+
+        if file_path != ":memory:":
+            self.file_path.parent.mkdir(parents=True, exist_ok=True)
 
         self.connection = sqlite3.connect(
             str(self.file_path),
@@ -17,7 +19,6 @@ class KeyValueStore:
             check_same_thread=False,
         )
         self.connection.row_factory = sqlite3.Row
-
         self._initialize()
 
     def _initialize(self):
@@ -84,6 +85,14 @@ class KeyValueStore:
 
         return dict(row) if row else None
 
+    def list_records(self):
+        """Return every current record, including deletion tombstones."""
+        rows = self.connection.execute(
+            "SELECT * FROM records ORDER BY key"
+        ).fetchall()
+
+        return [dict(row) for row in rows]
+
     def get(self, key):
         record = self.get_record(key)
 
@@ -133,10 +142,7 @@ class KeyValueStore:
         }
 
         if not isinstance(record, dict) or not required.issubset(record):
-            return {
-                "success": False,
-                "reason": "invalid_record",
-            }
+            return {"success": False, "reason": "invalid_record"}
 
         key = record["key"]
         value = record["value"]
