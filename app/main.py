@@ -37,7 +37,7 @@ app = FastAPI(
         "A self-healing distributed key-value store with "
         "quorum-based consistency and version-aware replica recovery."
     ),
-    version="0.2.0",
+    version="0.3.0",
 )
 
 node = Node(
@@ -138,9 +138,15 @@ def cluster_config():
     }
 
 
-# Internal endpoint: followers receive the leader's exact record.
+# Internal replication is accepted only by follower nodes.
 @app.post("/internal/replicate", tags=["Internal Replication"])
 def receive_replica(record: dict):
+    if node.role != "follower":
+        raise HTTPException(
+            status_code=403,
+            detail="Internal replication is accepted only by followers",
+        )
+
     result = node.storage.apply_record(record)
 
     if not result["success"]:
@@ -152,7 +158,7 @@ def receive_replica(record: dict):
     return result
 
 
-# Internal endpoint: return the complete record, including tombstones.
+# Internal endpoint: return complete record, including tombstones.
 @app.get("/internal/record/{key}", tags=["Internal Replication"])
 def internal_get_record(key: str):
     return {
@@ -161,21 +167,17 @@ def internal_get_record(key: str):
     }
 
 
-# Store a key-value pair using a JSON request body.
+# Only the leader can coordinate client writes.
 @app.put("/kv/{key}", tags=["Key-Value"])
 def put_value(key: str, request: PutRequest):
-    value = request.value
-
-    record = node.storage.put(key, value)
-
     if node.role != "leader":
-        return {
-            "key": key,
-            "value": value,
-            "version": record["version"],
-            "status": "stored",
-            "node": node.node_id,
-        }
+        raise HTTPException(
+            status_code=403,
+            detail="Client writes are accepted only by the leader",
+        )
+
+    value = request.value
+    record = node.storage.put(key, value)
 
     replication = node.replicate_record(record)
 
@@ -204,6 +206,7 @@ def put_value(key: str, request: PutRequest):
 
 @app.get("/kv/{key}", tags=["Key-Value"])
 def get_value(key: str):
+    # Followers can serve reads from their local storage.
     if node.role != "leader":
         value = node.storage.get(key)
 
@@ -317,7 +320,7 @@ def get_value(key: str):
 
     newest_record = reference
 
-    # Update the leader if it has a stale or missing record.
+    # Repair the leader if it has a stale or missing record.
     if (
         local_record is None
         or local_record["version"] < newest_record["version"]
@@ -367,22 +370,14 @@ def get_value(key: str):
     }
 
 
+# Only the leader can coordinate client deletes.
 @app.delete("/kv/{key}", tags=["Key-Value"])
 def delete_value(key: str):
     if node.role != "leader":
-        value = node.storage.delete(key)
-
-        if value is None:
-            raise HTTPException(status_code=404, detail="Key not found")
-
-        record = node.storage.get_record(key)
-
-        return {
-            "key": key,
-            "status": "deleted",
-            "version": record["version"],
-            "node": node.node_id,
-        }
+        raise HTTPException(
+            status_code=403,
+            detail="Client deletes are accepted only by the leader",
+        )
 
     value = node.storage.delete(key)
 
